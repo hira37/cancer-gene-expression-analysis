@@ -17,5 +17,11 @@ We analyse gene expression (RNA-seq) data of cancer patients and healthy individ
 2. Python (Google Colab): DEG analysis, apoptosis genes, plots, ML model
 3. GitHub: code and results
 
+## Files
+- `cancer_gene_expression_demo.ipynb`: Python (Colab) notebook that finds DEGs and draws a volcano plot. It uses simulated practice data.
+
 ## Status
-Work in progress. Galaxy practice done up to trimming. Python code coming next.
+Work in progress.
+- Galaxy practice done up to trimming (Cutadapt).
+- Python DEG analysis and volcano plot done on practice data.
+- Next: real count table (GEO/TCGA), heatmap, apoptosis analysis and ML model.
