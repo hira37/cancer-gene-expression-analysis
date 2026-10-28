@@ -9,7 +9,8 @@ from sklearn.model_selection import train_test_split
 from sklearn.linear_model import LogisticRegression
 from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
-from sklearn.metrics import accuracy_score, roc_auc_score, confusion_matrix, roc_curve
+from sklearn.metrics import accuracy_score, roc_auc_score, confusion_matrix, roc_curve, adjusted_rand_score
+from scipy.cluster.hierarchy import linkage, dendrogram, fcluster, to_tree
 
 st.set_page_config(page_title="Cancer Gene Expression Explorer", page_icon="🧬", layout="wide")
 
@@ -151,7 +152,230 @@ n_down = int((result["DEG"] & (result["log2FC"] < 0)).sum())
 top_deg = result[result["DEG"]].sort_values("padj").index.tolist()
 present_apo = [g for g in apoptosis if g in result.index]
 
-tabs = st.tabs(["📊 Overview", "🌋 DEGs", "🔥 Heatmap", "💀 Apoptosis", "🤖 Prediction", "🧪 Mutations", "ℹ️ Help"])
+# ------------------------------------------------------------------ pathways, sequences, variants
+PROLIF = {"MKI67": "promote", "PCNA": "promote", "TOP2A": "promote", "MCM2": "promote", "MYC": "promote",
+          "EGFR": "promote", "ERBB2": "promote", "KRAS": "promote", "PIK3CA": "promote", "AKT1": "promote",
+          "MTOR": "promote", "VEGFA": "promote", "FOXM1": "promote", "TYMS": "promote", "PTEN": "inhibit"}
+CYCLE = {"CCND1": "promote", "CCNE1": "promote", "CCNA2": "promote", "CCNB1": "promote", "CDK1": "promote",
+         "CDK2": "promote", "CDK4": "promote", "CDK6": "promote", "E2F1": "promote", "PLK1": "promote",
+         "AURKA": "promote", "AURKB": "promote", "CDC20": "promote", "MDM2": "promote", "CDKN1A": "inhibit",
+         "CDKN1B": "inhibit", "CDKN2A": "inhibit", "RB1": "inhibit", "TP53": "inhibit", "CHEK2": "inhibit", "ATM": "inhibit"}
+
+_B = "TCAG"
+_AA = "FFLLSSSSYY**CC*WLLLLPPPPHHQQRRRRIIIMTTTTNNKKSSRRVVVVAAAADDEEGGGG"
+CODON = {a + b + c: _AA[16 * i + 4 * j + k] for i, a in enumerate(_B) for j, b in enumerate(_B) for k, c in enumerate(_B)}
+
+
+@st.cache_data(show_spinner=False, ttl=3600)
+def fetch_cds(symbol):
+    """Reference coding sequence (CDS) of the canonical human transcript, from the Ensembl REST service."""
+    import requests
+    try:
+        r = requests.get(f"https://rest.ensembl.org/lookup/symbol/homo_sapiens/{symbol}", params={"expand": 1},
+                         headers={"Content-Type": "application/json"}, timeout=25)
+        r.raise_for_status()
+        trs = [t for t in r.json().get("Transcript", []) if t.get("Translation")]
+        canon = [t for t in trs if t.get("is_canonical") == 1] or trs
+        if not canon:
+            return None, None, "no protein-coding transcript found"
+        tid = canon[0]["id"]
+        s = requests.get(f"https://rest.ensembl.org/sequence/id/{tid}", params={"type": "cds"},
+                         headers={"Content-Type": "text/plain"}, timeout=25)
+        s.raise_for_status()
+        return s.text.strip().upper(), tid, None
+    except Exception as e:
+        return None, None, str(e)
+
+
+def apply_variants(cds, gm):
+    """Apply single-base substitutions (CDS position, ref, alt) per patient. Indels are not handled."""
+    seqs, rows, notes = {}, [], []
+    for smp, grp in gm.groupby("sample"):
+        s = list(cds)
+        for _, v in grp.iterrows():
+            try:
+                pos, ref, alt = int(v["position"]), str(v["ref"]).upper(), str(v["alt"]).upper()
+            except Exception:
+                notes.append(f"{smp}: unreadable variant row")
+                continue
+            if not (1 <= pos <= len(cds)) or len(ref) != 1 or len(alt) != 1 or cds[pos - 1] != ref:
+                notes.append(f"{smp}: position {pos} ref {ref} does not match the reference CDS, skipped")
+                continue
+            s[pos - 1] = alt
+            ci = (pos - 1) // 3
+            c_ref = cds[ci * 3: ci * 3 + 3]
+            c_alt = list(c_ref)
+            c_alt[(pos - 1) % 3] = alt
+            c_alt = "".join(c_alt)
+            a1, a2 = CODON.get(c_ref, "?"), CODON.get(c_alt, "?")
+            effect = "synonymous" if a1 == a2 else "nonsense (stop gained)" if a2 == "*" else "stop lost" if a1 == "*" else "missense"
+            rows.append({"patient": smp, "position": pos, "change": f"{ref}>{alt}", "codon": f"{c_ref}>{c_alt}",
+                         "amino acid": f"{a1}{ci + 1}{a2}", "effect": effect})
+        seqs[smp] = "".join(s)
+    return seqs, pd.DataFrame(rows), notes
+
+
+def aln_html(ref, seqs, groups, width=60):
+    """Alignment as HTML: reference on top, patients below, differences in red, * = identical in all rows."""
+    import html
+    names = ["Reference"] + [f"{i} ({groups.get(i, '')})" for i in seqs]
+    rows = [ref] + list(seqs.values())
+    pad = max(len(n) for n in names)
+    out = []
+    for st0 in range(0, len(ref), width):
+        seg = [r[st0:st0 + width] for r in rows]
+        out.append(f"{'':<{pad}}  {st0 + 1}")
+        for n, sgm in zip(names, seg):
+            cells = "".join(f'<span style="background:#c0392b;color:#fff">{c}</span>' if (n != "Reference" and c != seg[0][k]) else c
+                            for k, c in enumerate(sgm))
+            out.append(f"{html.escape(n.ljust(pad))}  {cells}")
+        out.append(f"{'':<{pad}}  " + "".join("*" if all(r[k] == seg[0][k] for r in seg) else " " for k in range(len(seg[0]))))
+        out.append("")
+    return '<div style="overflow-x:auto"><pre style="font-size:12px;line-height:1.35">' + "\n".join(out) + "</pre></div>"
+
+
+def to_fasta(entries):
+    out = []
+    for h, s in entries:
+        out.append(">" + h)
+        out += [s[i:i + 70] for i in range(0, len(s), 70)]
+    return "\n".join(out) + "\n"
+
+
+MSA_SCRIPT = '''"""Multiple sequence alignment for __GENE__ (control vs disease patients).
+Needs: pip install requests.  Optional: MAFFT or Clustal Omega installed (otherwise a plain stacked alignment is written,
+which is correct for single-base substitutions because all sequences keep the same length).
+
+variants.csv columns: sample,gene,position,ref,alt   (position = coding-sequence position, 1-based)
+groups.csv columns:   sample,label                   (for example cancer / healthy)
+"""
+import csv, shutil, subprocess, requests
+
+GENE = "__GENE__"
+H = {"Content-Type": "application/json"}
+
+r = requests.get(f"https://rest.ensembl.org/lookup/symbol/homo_sapiens/{GENE}", params={"expand": 1}, headers=H, timeout=30).json()
+tr = [t for t in r["Transcript"] if t.get("Translation")]
+tid = ([t for t in tr if t.get("is_canonical") == 1] or tr)[0]["id"]
+cds = requests.get(f"https://rest.ensembl.org/sequence/id/{tid}", params={"type": "cds"},
+                   headers={"Content-Type": "text/plain"}, timeout=30).text.strip().upper()
+print(GENE, tid, len(cds), "bp")
+
+groups = {row["sample"]: row["label"] for row in csv.DictReader(open("groups.csv"))}
+seqs = {s: list(cds) for s in groups}
+for v in csv.DictReader(open("variants.csv")):
+    if v["gene"] == GENE and v["sample"] in seqs:
+        p = int(v["position"])
+        if cds[p - 1] == v["ref"].upper():
+            seqs[v["sample"]][p - 1] = v["alt"].upper()
+        else:
+            print("skipped (reference does not match):", v)
+
+with open(GENE + "_input.fasta", "w") as f:
+    f.write(f">{GENE}_reference\\n{cds}\\n")
+    for s, q in seqs.items():
+        f.write(f">{s}|{groups[s]}\\n{''.join(q)}\\n")
+
+out = GENE + "_aligned.fasta"
+if shutil.which("mafft"):
+    open(out, "w").write(subprocess.run(["mafft", "--auto", GENE + "_input.fasta"], capture_output=True, text=True).stdout)
+elif shutil.which("clustalo"):
+    subprocess.run(["clustalo", "-i", GENE + "_input.fasta", "-o", out, "--force"])
+else:
+    import shutil as sh
+    sh.copy(GENE + "_input.fasta", out)
+    print("MAFFT/Clustal not found: wrote the stacked alignment (valid for substitutions only).")
+print("Done:", out)
+'''
+
+
+def to_newick(node, labels, parent_dist):
+    if node.is_leaf():
+        nm = "".join(ch if ch not in "(),:; " else "_" for ch in str(labels[node.id]))
+        return f"{nm}:{max(parent_dist, 0):.4f}"
+    return f"({to_newick(node.left, labels, node.dist)},{to_newick(node.right, labels, node.dist)}):{max(parent_dist - node.dist, 0):.4f}"
+
+
+def gene_panel(g, key):
+    """Everything about one gene: expression, patients, sequence, alignment and SNP verdict."""
+    st.markdown(f"#### {g}")
+    role = "pro-apoptotic" if g in PRO else "anti-apoptotic" if g in ANTI else \
+        "cell-cycle promoting" if CYCLE.get(g) == "promote" else "cell-cycle inhibiting" if CYCLE.get(g) == "inhibit" else \
+        "proliferation promoting" if PROLIF.get(g) == "promote" else "proliferation inhibiting" if PROLIF.get(g) == "inhibit" else "n/a"
+    if PROTEIN_INFO.get(g):
+        st.caption(PROTEIN_INFO[g])
+    r = result.loc[g]
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("log2 fold change", f"{r['log2FC']:.2f}")
+    c2.metric("adjusted p-value", f"{r['padj']:.3g}")
+    c3.metric("direction", r["direction"])
+    c4.metric("role", role)
+
+    with st.expander("Patient IDs and expression of this gene"):
+        pat = pd.DataFrame({"patient": sub.index, "group": sub["group"].values,
+                            "log2 expression": log_counts.loc[g, sub.index].values.round(3)}).sort_values(["group", "patient"])
+        st.dataframe(pat, hide_index=True)
+
+    st.markdown("**Sequence and multiple sequence alignment (this gene only)**")
+    st.info("Sequences cannot be read from expression values. The reference sequence comes from Ensembl. "
+            "Patient-specific sequences are built only if a mutation file with position, ref and alt is uploaded.")
+    cds = None
+    if st.checkbox("Load reference sequence from Ensembl (needs internet)", key=f"{key}_{g}_seq"):
+        cds, tid, err = fetch_cds(g)
+        if err:
+            st.error(f"Could not load the sequence: {err}")
+        else:
+            st.caption(f"Ensembl canonical transcript {tid}, coding sequence {len(cds)} bp")
+
+    gm = None
+    if mutations is not None and {"sample", "gene"}.issubset(mutations.columns):
+        gm = mutations[(mutations["gene"].astype(str) == g) & mutations["sample"].isin(sub.index)]
+    has_pos = gm is not None and {"position", "ref", "alt"}.issubset(gm.columns)
+    groups = sub["group"].to_dict()
+    applied = pd.DataFrame()
+    if cds:
+        seqs = {}
+        if has_pos and len(gm):
+            seqs, applied, notes = apply_variants(cds, gm)
+            for n in notes[:5]:
+                st.warning(n)
+        show = {i: seqs[i] for i in list(seqs)[:40]}
+        if show:
+            st.markdown(aln_html(cds, show, groups), unsafe_allow_html=True)
+            st.caption(f"Alignment of the reference and {len(show)} patient(s) carrying a variant. Red = differs from the reference. "
+                       "Patients not listed have the reference sequence.")
+        else:
+            st.info("No patient variants for this gene in the data, so every patient has the reference sequence (nothing to align).")
+        entries = [(f"{g}_reference", cds)] + [(f"{i}|{groups[i]}|{g}", seqs.get(i, cds)) for i in sub.index] if has_pos else [(f"{g}_reference", cds)]
+        st.download_button("Download sequences (FASTA)", to_fasta(entries), f"{g}_sequences.fasta", key=f"{key}_{g}_fa")
+    st.download_button("Download MSA script (Python)", MSA_SCRIPT.replace("__GENE__", g), f"msa_{g}.py", key=f"{key}_{g}_py")
+
+    st.markdown("**Is a SNP responsible?**")
+    if gm is None:
+        st.warning("This data source has no mutation/SNP data, so this cannot be answered here. "
+                   "Expression alone can show a gene is up or down, but not which sequence change causes it. "
+                   "Upload a mutation CSV (sample, gene, position, ref, alt) to test it.")
+        return
+    carriers = set(gm["sample"])
+    a = len([s for s in carriers if groups.get(s) == case])
+    b = len([s for s in carriers if groups.get(s) == control])
+    _, p = stats.fisher_exact([[a, n_case - a], [b, n_control - b]])
+    st.write(f"Patients with a variant in **{g}**: {case} **{a}/{n_case}** ({a / n_case * 100:.0f}%), {control} **{b}/{n_control}** ({b / n_control * 100:.0f}%). Fisher exact p = {p:.3g}.")
+    if len(applied):
+        st.dataframe(applied, hide_index=True)
+        harmful = applied["effect"].isin(["missense", "nonsense (stop gained)", "stop lost"]).any()
+    else:
+        harmful = None
+    if a + b == 0:
+        st.success(f"No variant of {g} found in these patients, so a SNP in this gene does not explain the expression change here.")
+    elif p < 0.05 and a / n_case > b / n_control:
+        st.error(f"Variants in {g} are significantly more common in {case}: a SNP in this gene may be involved." +
+                 (" Some change the protein (missense/nonsense)." if harmful else ""))
+    else:
+        st.info(f"Variants exist in {g}, but they are not significantly enriched in {case}. This data does not show a SNP responsible.")
+    st.caption("Association only, not proof of cause. Variants are assumed present in all copies. Insertions and deletions are not handled.")
+
+tabs = st.tabs(["📊 Overview", "🌋 DEGs", "🔥 Heatmap", "💀 Apoptosis", "🤖 Prediction", "🧪 Mutations", "🌳 Tree", "🔁 Proliferation", "🔄 Cell cycle", "ℹ️ Help"])
 
 # ---- Overview
 with tabs[0]:
@@ -303,6 +527,10 @@ with tabs[3]:
         else:
             st.info("Mixed pattern: some apoptosis genes go up and some go down.")
         st.caption("This is an expression-based hint, not proof. It only counts genes that pass both cut-offs in the sidebar.")
+        st.markdown("---")
+        st.subheader("Click a gene: details, sequence, alignment and SNP check")
+        pick_apo = st.radio("Gene", present_apo, horizontal=True, key="apo_pick")
+        gene_panel(pick_apo, "apo")
 
 # ---- Prediction
 with tabs[4]:
@@ -408,8 +636,107 @@ with tabs[5]:
         st.dataframe(m)
         st.caption("Mutations come from the mutation file. They cannot be found from expression values alone.")
 
-# ---- Help
+# ---- Tree (sample clustering)
 with tabs[6]:
+    st.subheader("Sample tree: do cancer and control samples separate?")
+    basis = st.radio("Genes used for the tree", ["Top 500 most variable genes", "DEGs only", "Apoptosis genes"], horizontal=True)
+    method = st.selectbox("Linkage", ["ward", "average", "complete"])
+    if basis == "DEGs only" and len(top_deg) >= 3:
+        used = top_deg[:500]
+    elif basis == "Apoptosis genes" and len(present_apo) >= 3:
+        used = present_apo
+    else:
+        if basis != "Top 500 most variable genes":
+            st.warning("Fewer than 3 genes available for this choice, using the most variable genes instead.")
+        used = log_counts.var(axis=1).nlargest(500).index.tolist()
+    M = log_counts.loc[used].T
+    M = (M - M.mean()) / (M.std() + 1e-9)
+    Zl = linkage(M.values, method=method)
+    names = list(M.index)
+    colmap = {case: "firebrick", control: "steelblue"}
+    fig, ax = plt.subplots(figsize=(11, 4.8))
+    dd = dendrogram(Zl, labels=names, ax=ax, leaf_rotation=90, leaf_font_size=8, no_labels=len(names) > 40, color_threshold=0, above_threshold_color="grey")
+    if len(names) <= 40:
+        for lb in ax.get_xmajorticklabels():
+            lb.set_color(colmap[sub.loc[lb.get_text(), "group"]])
+    else:
+        top_y = ax.get_ylim()[1]
+        for i, leaf in enumerate(dd["leaves"]):
+            ax.scatter(5 + 10 * i, -0.03 * top_y, c=colmap[sub["group"].iloc[leaf]], marker="s", s=14, clip_on=False)
+    ax.set_title(f"Sample tree ({len(used)} genes, {method} linkage). Red = {case}, blue = {control}")
+    ax.set_ylabel("distance")
+    st.pyplot(fig)
+
+    cl = fcluster(Zl, 2, "maxclust")
+    ct = pd.crosstab(pd.Series(cl, index=names, name="cluster"), sub["group"])
+    purity = ct.max(axis=1).sum() / ct.values.sum()
+    ari = adjusted_rand_score(sub["group"], cl)
+    m1, m2, m3 = st.columns(3)
+    m1.metric("Purity of 2 clusters", f"{purity * 100:.0f}%")
+    m2.metric("Adjusted Rand index", f"{ari:.2f}")
+    m3.metric("Samples", len(names))
+    st.dataframe(ct)
+    if purity >= 0.9 and ari >= 0.6:
+        st.success(f"{case} and {control} separate clearly into two clusters.")
+    elif purity >= 0.75:
+        st.info(f"{case} and {control} partly separate. Some samples sit in the other group's cluster.")
+    else:
+        st.warning(f"{case} and {control} do not separate well with these genes.")
+    st.download_button("Download tree (Newick)", to_newick(to_tree(Zl), names, to_tree(Zl).dist) + ";", "sample_tree.nwk")
+    st.caption("This is a similarity tree of samples built from expression (hierarchical clustering), not an evolutionary tree. "
+               "A sequence-based phylogenetic tree needs sequences of every patient.")
+
+
+def render_pathway(title, genes, key, text_up, text_down):
+    present = [g for g in genes if g in result.index]
+    if not present:
+        st.info(f"None of the {title} genes are in this data.")
+        return
+    tb = result.loc[present, ["log2FC", "padj", "direction"]].copy()
+    tb["role"] = [genes[g] for g in present]
+    mc = log_counts.loc[present, case_cols].mean(axis=1)
+    mk = log_counts.loc[present, ctrl_cols].mean(axis=1)
+    x = np.arange(len(present))
+    fig, ax = plt.subplots(figsize=(max(6, 0.55 * len(present) + 3), 4.2))
+    ax.bar(x - 0.18, mc, 0.36, label=case, color="firebrick")
+    ax.bar(x + 0.18, mk, 0.36, label=control, color="steelblue")
+    ax.set_xticks(x)
+    ax.set_xticklabels(present, rotation=45, ha="right")
+    ax.set_ylabel("mean log2 expression")
+    ax.legend()
+    ax.set_title(title)
+    st.pyplot(fig)
+    st.dataframe(tb.round(4))
+    sg = tb[(tb["padj"] < padj_cut) & (tb["log2FC"].abs() > fc_cut)]
+    on = [g for g in sg.index if (sg.loc[g, "role"] == "promote" and sg.loc[g, "log2FC"] > 0) or (sg.loc[g, "role"] == "inhibit" and sg.loc[g, "log2FC"] < 0)]
+    off = [g for g in sg.index if (sg.loc[g, "role"] == "promote" and sg.loc[g, "log2FC"] < 0) or (sg.loc[g, "role"] == "inhibit" and sg.loc[g, "log2FC"] > 0)]
+    if sg.empty:
+        st.info(f"No {title} gene passes both cut-offs. Try relaxing them in the sidebar.")
+    elif len(on) > len(off):
+        st.success(f"{text_up} in {case}: " + ", ".join(on) + ".")
+    elif len(off) > len(on):
+        st.warning(f"{text_down} in {case}: " + ", ".join(off) + ".")
+    else:
+        st.info("Mixed pattern: some genes push the pathway up and some push it down.")
+    st.caption("Expression-based hint only. 'promote' genes speed the pathway up, 'inhibit' genes slow it down.")
+    st.markdown("---")
+    st.subheader("Click a gene: details, sequence, alignment and SNP check")
+    pick = st.radio("Gene", present, horizontal=True, key=key + "_pick")
+    gene_panel(pick, key)
+
+
+# ---- Proliferation
+with tabs[7]:
+    st.subheader("Cell proliferation genes")
+    render_pathway("cell proliferation", PROLIF, "pro", "Proliferation looks more active", "Proliferation looks less active")
+
+# ---- Cell cycle
+with tabs[8]:
+    st.subheader("Cell cycle pathway genes")
+    render_pathway("cell cycle", CYCLE, "cyc", "Cell cycle looks more active (more division)", "Cell cycle looks less active")
+
+# ---- Help
+with tabs[9]:
     st.markdown(
         """
 **Expression CSV** (one row per sample):
@@ -423,7 +750,7 @@ with tabs[6]:
 - Choose **Raw read counts** for RNA-seq counts, or **Already log2** for microarray data that is already log2 scaled.
 - Pick the **control** and **case** groups in the sidebar. For malignant vs benign, set control = benign and case = malignant.
 
-**Mutations CSV** (optional): columns `sample`, `gene`, `mutation_type`.
+**Mutations CSV** (optional): columns `sample`, `gene`, `mutation_type`. For sequences and SNP checks also add `position` (coding-sequence position), `ref` and `alt` (single-base changes).
 
 **Real breast cancer data:** GSE42568 (public, GEO) has 104 breast cancer and 17 normal breast tissue samples. It appears as a data source once the file `breast_cancer_gse42568.csv` is in the repository.
 
